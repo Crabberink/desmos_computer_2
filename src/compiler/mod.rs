@@ -1,4 +1,4 @@
-use std::num::{IntErrorKind};
+use std::{collections::HashMap, num::IntErrorKind};
 
 pub fn compile_source(source: &str) -> Result<String, Vec<String>> {
 	let lines = source.lines();
@@ -14,17 +14,30 @@ pub fn compile_source(source: &str) -> Result<String, Vec<String>> {
 			continue;
 		}
 
-		let Some((instruction, args)) = cleaned_line.split_once(' ') else {
+
+		let instruction: &str;
+		let args: &str;
+
+		if let Some((l_inst, l_args)) = cleaned_line.split_once(' ') {
+			instruction = l_inst;
+			args = l_args;
+		} else if !cleaned_line.is_empty() { 
+			instruction = &cleaned_line;
+			args = "";
+		} else { 
 			continue;
-		};
+		}
 
 		match parse_instruction_archetype(instruction) {
-			InstructionArchetype::Unknown => { errors.push(format!("Line {}: ERROR Unknown instruction", i)); continue; },
+			InstructionArchetype::Unknown => { errors.push(format!("Line {}: ERROR Unknown instruction", i+1)); continue; },
+			InstructionArchetype::Label(label) => {
+				program.push(Instruction::Label { label });
+			},
 			InstructionArchetype::DestVal(opcode) => {
 				let dest_val = match parse_dest_value(args) {
 					Ok(pair) => pair,
 					Err(err) => {
-						errors.push(format!("Line {}: ERROR {}", i, err));
+						errors.push(format!("Line {}: ERROR {}", i+1, err));
 						continue;
 					},
 				};
@@ -47,16 +60,85 @@ pub fn compile_source(source: &str) -> Result<String, Vec<String>> {
 					},
 				}
 			},
-		}
-	}
+			InstructionArchetype::Value(opcode) => {
+				let value = match parse_instruction_value(args) {
+					Ok(value) => value,
+					Err(err) => {
+						errors.push(format!("Line {}: ERROR {}", i+1, err));
+						continue;
+					},
+				};
 
-	if !errors.is_empty() {
-		return Err(errors);
+				match value {
+					InstructionValue::Normal { flags } => {
+						let instruction = Instruction::Normal { opcode: opcode | flags as u16 };
+
+						program.push(instruction);
+					},
+					InstructionValue::Immediate { flags, immediate } => {
+						let instruction = Instruction::Immediate { opcode: opcode | flags as u16, immediate };
+
+						program.push(instruction);
+					},
+					InstructionValue::LinkedImmediate { flags, label } => {
+						let instruction = Instruction::LinkedImmediate { opcode: opcode | flags as u16, label };
+
+						program.push(instruction);
+					},
+				}
+			}
+		}
 	}
 
 	let mut output = String::new();
 
 	output.push('[');
+
+	// First populate labels
+	let mut label_map: HashMap<String, u16> = HashMap::new();
+
+	let mut i = 0;
+	let mut address = 0;
+
+	while i < program.len() {
+		let instruction = program[i].clone();
+		match instruction {
+			Instruction::Immediate { .. } => {
+				address += 2;
+				i += 1;
+			},
+			Instruction::LinkedImmediate { .. } => {
+				address += 2;
+				i += 1;
+			},
+			Instruction::Normal { .. } => {
+				address += 1;
+				i += 1;
+			},
+			Instruction::Label { label } => {
+				program.remove(i);
+				label_map.insert(label, address);
+			}
+		}
+	}
+
+	// Link
+	for instruction in program.iter_mut() {
+		let Instruction::LinkedImmediate { opcode, label } = instruction else { continue; };
+
+		let Some(address) = label_map.get(label) else { 
+			errors.push(format!("Unknown label {}", label));
+			continue;
+		};
+
+		let new_instruction = Instruction::Immediate { opcode: *opcode, immediate: *address };
+
+		*instruction = new_instruction;
+	}
+
+	if !errors.is_empty() {
+		return Err(errors);
+	}
 
 	let empty_program = program.is_empty();
 
@@ -74,7 +156,10 @@ pub fn compile_source(source: &str) -> Result<String, Vec<String>> {
 			},
 			Instruction::LinkedImmediate { opcode: _, label: _ } => {
 				return Err(vec!["OH FUCK. THERES SOMEHOW A LINKEDIMMEDIATE IN THE OUTPUT PHASE!".to_string()]);
-			}
+			},
+			Instruction::Label { label: _ } => {
+				return Err(vec!["OH FUCK. THERES SOMEHOW A LABEL IN THE OUTPUT PHASE!".to_string()]);
+			},
 		}
 	}
 
@@ -121,6 +206,12 @@ enum ArgumentType {
 	AddrValue(u16)
 }
 
+enum InstructionValue {
+	Normal { flags: u8 },
+	Immediate { flags: u8, immediate: u16 },
+	LinkedImmediate { flags: u8, label: String }
+}
+
 enum DestValuePair {
 	Normal { flags: u8 },
 	Immediate { flags: u8, immediate: u16 },
@@ -128,7 +219,9 @@ enum DestValuePair {
 }
 
 enum InstructionArchetype {
+	Value(u16),
 	DestVal(u16),
+	Label(String),
 	Unknown,
 }
 
@@ -137,7 +230,55 @@ fn parse_instruction_archetype(instruction: &str) -> InstructionArchetype {
 		"mov" => InstructionArchetype::DestVal(0b0001_0000_1100_0000),
 		"add" => InstructionArchetype::DestVal(0b0001_0001_1100_0000),
 		"sub" => InstructionArchetype::DestVal(0b0001_0010_1100_0000),
+		"jmp" => InstructionArchetype::Value(0b0001_0000_0011_1000),
+		"jne" => InstructionArchetype::Value(0b0001_0000_0010_1000),
+		"jeq" => InstructionArchetype::Value(0b0001_0000_0001_0000),
+		"jgt" => InstructionArchetype::Value(0b0001_0000_0010_0000),
+		"jge" => InstructionArchetype::Value(0b0001_0000_0011_0000),
+		"jlt" => InstructionArchetype::Value(0b0001_0000_0000_1000),
+		"jle" => InstructionArchetype::Value(0b0001_0000_0001_1000),
+		"jnv" => InstructionArchetype::Value(0b0001_0000_0000_0000), // I have no clue why the fuck you would use this
+		"cmp" => InstructionArchetype::DestVal(0b0001_1000_0000_0000),
+		lbl if lbl.ends_with(':') => InstructionArchetype::Label(lbl.strip_suffix(':').unwrap().to_string()),
 		_ => InstructionArchetype::Unknown,
+	}
+}
+
+fn parse_instruction_value(args: &str) -> Result<InstructionValue, &str> {
+	let args: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
+
+	if args.len() != 1 {
+		return Err("Invalid number of arguments");
+	}
+
+	let value = match parse_argument(args[0]) {
+		Ok(value) => value,
+		Err(err) => {
+			return Err(err);
+		},
+	};
+
+	match value {
+		ArgumentType::AddrRegister(_) => {
+			Err("Doesn't support register memory access. First mov the value into the register and use it directly.")
+		},
+		ArgumentType::Register(register) => {
+			let reg_flags = register.flags();
+
+			#[allow(clippy::identity_op)]
+			let flags = 0b000 | reg_flags;
+
+			Ok(InstructionValue::Normal { flags })
+		},
+		ArgumentType::Label(label) => {
+			Ok(InstructionValue::LinkedImmediate { flags: 0b100, label })
+		},
+		ArgumentType::Value(val) => {
+			Ok(InstructionValue::Immediate { flags: 0b100, immediate: val })
+		},
+		ArgumentType::AddrValue(val) => {
+			Ok(InstructionValue::Immediate { flags: 0b110, immediate: val })
+		},
 	}
 }
 
@@ -332,6 +473,7 @@ fn is_mem_operand(arg: &str) -> bool {
 	arg.starts_with('[') && arg.ends_with(']')
 }
 
+#[derive(Clone)]
 enum Instruction {
 	/// A normal 16 bit instruction
 	Normal { opcode: u16 },
@@ -339,4 +481,5 @@ enum Instruction {
 	Immediate { opcode: u16, immediate: u16 },
 	/// Converted into an Immediate instruction by the linker
 	LinkedImmediate { opcode: u16, label: String },
+	Label { label: String },
 }
